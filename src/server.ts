@@ -3,43 +3,38 @@ import { config } from './config.js';
 import { runMigrations } from './db/migrate.js';
 import { logger } from './lib/logger.js';
 import { signAccessToken, verifyAccessToken } from './lib/jwt.js';
-import http from 'http';
 
 async function jwtSelfTest(): Promise<void> {
-  try {
-    const tok = await signAccessToken({
-      sub: 'self-test',
-      email: 'self-test@local',
-      tier: 'free_trial',
-      features: [],
-    });
-    const decoded = await verifyAccessToken(tok);
-    if (decoded.sub !== 'self-test') {
-      throw new Error('JWT self-test mismatch');
-    }
-    logger.info('JWT self-test passed');
-  } catch (e) {
-    logger.fatal({ err: (e as Error).message }, 'JWT_SELF_TEST_FAILED');
-    process.exit(1);
+  const tok = await signAccessToken({
+    sub: 'self-test',
+    email: 'self-test@local',
+    tier: 'free_trial',
+    features: [],
+  });
+  const decoded = await verifyAccessToken(tok);
+  if (decoded.sub !== 'self-test') {
+    throw new Error('JWT self-test sub mismatch');
   }
+  logger.info('JWT self-test passed');
 }
 
 async function waitForDb(maxAttempts = 10, delayMs = 3000): Promise<void> {
   const { db } = await import('./db/client.js');
+  let lastErr: Error | null = null;
   for (let i = 1; i <= maxAttempts; i++) {
     try {
       await db`SELECT 1`;
       logger.info('Database connection established');
       return;
     } catch (e) {
+      lastErr = e as Error;
       logger.warn({ attempt: i, maxAttempts, err: (e as Error).message }, 'DB not ready, retrying...');
-      if (i === maxAttempts) {
-        logger.fatal({ err: (e as Error).message }, 'DB_CONNECTION_FAILED');
-        process.exit(1);
+      if (i < maxAttempts) {
+        await new Promise(r => setTimeout(r, delayMs));
       }
-      await new Promise(r => setTimeout(r, delayMs));
     }
   }
+  throw new Error(`DB_CONNECTION_FAILED after ${maxAttempts} attempts: ${lastErr?.message}`);
 }
 
 async function main() {
@@ -56,19 +51,8 @@ async function main() {
 
 main().catch(err => {
   const msg = err?.message ?? String(err);
-  const stack = err?.stack ?? '';
-  logger.fatal({ err: msg, stack }, 'UNHANDLED_STARTUP_ERROR');
+  logger.fatal({ err: msg, stack: err?.stack }, 'UNHANDLED_STARTUP_ERROR');
   console.error('STARTUP FAILED:', msg);
-  console.error(stack);
-
-  // Keep the process alive for 5 minutes so Coolify logs API can fetch the error.
-  const errBody = JSON.stringify({ error: msg, stack });
-  const diag = http.createServer((_req, res) => {
-    res.writeHead(503, { 'Content-Type': 'application/json' });
-    res.end(errBody);
-  });
-  diag.listen(config.PORT, '0.0.0.0', () => {
-    console.error(`Diagnostic server on port ${config.PORT} — will exit in 5 min`);
-  });
-  setTimeout(() => process.exit(1), 5 * 60 * 1000);
+  console.error(err?.stack ?? '');
+  process.exit(1);
 });

@@ -17,7 +17,8 @@ const schema = z.object({
 
 const parsed = schema.safeParse(process.env);
 if (!parsed.success) {
-  console.error('Invalid environment variables:', parsed.error.flatten().fieldErrors);
+  const errors = JSON.stringify(parsed.error.flatten().fieldErrors, null, 2);
+  console.error('CONFIG_VALIDATION_FAILED:', errors);
   process.exit(1);
 }
 
