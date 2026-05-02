@@ -3,6 +3,7 @@ import { config } from './config.js';
 import { runMigrations } from './db/migrate.js';
 import { logger } from './lib/logger.js';
 import { signAccessToken, verifyAccessToken } from './lib/jwt.js';
+import http from 'http';
 
 async function jwtSelfTest(): Promise<void> {
   try {
@@ -54,7 +55,20 @@ async function main() {
 }
 
 main().catch(err => {
-  logger.fatal({ err: err?.message, stack: err?.stack }, 'UNHANDLED_STARTUP_ERROR');
-  console.error(err);
-  process.exit(1);
+  const msg = err?.message ?? String(err);
+  const stack = err?.stack ?? '';
+  logger.fatal({ err: msg, stack }, 'UNHANDLED_STARTUP_ERROR');
+  console.error('STARTUP FAILED:', msg);
+  console.error(stack);
+
+  // Keep the process alive for 5 minutes so Coolify logs API can fetch the error.
+  const errBody = JSON.stringify({ error: msg, stack });
+  const diag = http.createServer((_req, res) => {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(errBody);
+  });
+  diag.listen(config.PORT, '0.0.0.0', () => {
+    console.error(`Diagnostic server on port ${config.PORT} — will exit in 5 min`);
+  });
+  setTimeout(() => process.exit(1), 5 * 60 * 1000);
 });
