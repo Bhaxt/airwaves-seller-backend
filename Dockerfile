@@ -11,5 +11,7 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/src/db/migrations ./dist/db/migrations
 COPY --from=build /app/node_modules ./node_modules
 COPY package.json .
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 EXPOSE 3000
-CMD ["node", "dist/server.js"]
+CMD ["sh", "entrypoint.sh"]
