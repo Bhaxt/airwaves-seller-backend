@@ -21,7 +21,7 @@ export async function buildApp() {
       if (!origin || origin.startsWith('chrome-extension://') || origin === config.PUBLIC_URL) {
         callback(null, true);
       } else {
-        callback(new Error('CORS'));
+        callback(new Error('CORS'), false);
       }
     }
   });

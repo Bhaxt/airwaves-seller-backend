@@ -32,7 +32,7 @@ const webhookRoutes: FastifyPluginAsync = async (fastify) => {
 
     const inserted = await db`
       INSERT INTO webhook_events (id, type, payload)
-      VALUES (${event.id}, ${event.type}, ${db.json(event.data as unknown as object)})
+      VALUES (${event.id}, ${event.type}, ${db.json(event.data as unknown as Parameters<typeof db.json>[0])})
       ON CONFLICT (id) DO NOTHING
     `;
 
