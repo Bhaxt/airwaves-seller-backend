@@ -1,9 +1,9 @@
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --include=dev
 COPY . .
-RUN npm run build
+RUN ./node_modules/.bin/tsc --version && ./node_modules/.bin/tsc
 
 FROM node:20-alpine AS runtime
 WORKDIR /app
