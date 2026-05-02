@@ -9,7 +9,7 @@ let _publicKey: KeyLike | null = null;
 
 async function getPrivateKey(): Promise<KeyLike> {
   if (!_privateKey) {
-    _privateKey = (await importPKCS8(config.JWT_PRIVATE_KEY, ALG)) as KeyLike;
+    _privateKey = (await importPKCS8(config.JWT_PRIVATE_KEY.replace(/\\n/g, '\n'), ALG)) as KeyLike;
   }
   return _privateKey;
 }
