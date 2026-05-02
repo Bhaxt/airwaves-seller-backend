@@ -23,7 +23,29 @@ async function jwtSelfTest(): Promise<void> {
   }
 }
 
+async function waitForDb(maxAttempts = 10, delayMs = 3000): Promise<void> {
+  const { db } = await import('./db/client.js');
+  for (let i = 1; i <= maxAttempts; i++) {
+    try {
+      await db`SELECT 1`;
+      logger.info('Database connection established');
+      return;
+    } catch (e) {
+      logger.warn({ attempt: i, maxAttempts, err: (e as Error).message }, 'DB not ready, retrying...');
+      if (i === maxAttempts) {
+        logger.fatal({ err: (e as Error).message }, 'DB_CONNECTION_FAILED');
+        process.exit(1);
+      }
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+}
+
 async function main() {
+  logger.info('Starting AirWaves Seller backend...');
+  logger.info({ DATABASE_URL: config.DATABASE_URL.replace(/:\/\/[^@]+@/, '://***@') }, 'Config loaded');
+
+  await waitForDb();
   await runMigrations();
   await jwtSelfTest();
   const app = await buildApp();
@@ -32,6 +54,7 @@ async function main() {
 }
 
 main().catch(err => {
+  logger.fatal({ err: err?.message, stack: err?.stack }, 'UNHANDLED_STARTUP_ERROR');
   console.error(err);
   process.exit(1);
 });
