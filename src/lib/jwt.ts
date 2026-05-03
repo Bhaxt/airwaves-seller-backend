@@ -18,10 +18,17 @@ async function getPublicKey(): Promise<KeyLike> {
   if (_publicKey) return _publicKey;
 
   if (config.JWT_PUBLIC_KEY_BASE64) {
-    const base64 = config.JWT_PUBLIC_KEY_BASE64.trim();
-    const pem = base64.includes('BEGIN PUBLIC KEY')
-      ? base64
-      : `-----BEGIN PUBLIC KEY-----\n${base64}\n-----END PUBLIC KEY-----`;
+    const raw = config.JWT_PUBLIC_KEY_BASE64.trim();
+    // Value may be base64(PEM) or a raw PEM — decode to find out.
+    let pem: string;
+    if (raw.includes('BEGIN PUBLIC KEY')) {
+      pem = raw;
+    } else {
+      const decoded = Buffer.from(raw, 'base64').toString('utf8');
+      pem = decoded.includes('BEGIN PUBLIC KEY')
+        ? decoded
+        : `-----BEGIN PUBLIC KEY-----\n${raw}\n-----END PUBLIC KEY-----`;
+    }
     _publicKey = (await importSPKI(pem, ALG)) as KeyLike;
     return _publicKey;
   }
