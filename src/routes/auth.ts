@@ -29,8 +29,10 @@ const authRoutes: FastifyPluginAsync = async (fastify) => {
     return reply.status(202).send(body);
   }
 
-  fastify.post('/login', loginHandler);
-  fastify.post('/register', loginHandler);
+  const authRateLimit = { config: { rateLimit: { max: 10, timeWindow: 60 * 1000 } } };
+
+  fastify.post('/login', authRateLimit, loginHandler);
+  fastify.post('/register', authRateLimit, loginHandler);
 
   fastify.get('/verify', async (request, reply) => {
     const { token, client } = request.query as { token?: string; client?: string };
@@ -50,7 +52,7 @@ const authRoutes: FastifyPluginAsync = async (fastify) => {
     );
   });
 
-  fastify.post('/verify-code', async (request, reply) => {
+  fastify.post('/verify-code', authRateLimit, async (request, reply) => {
     const { email, code } = verifyCodeBody.parse(request.body);
     const { user, tokens } = await verifyMagicLinkCode({
       email,

@@ -1,7 +1,7 @@
 import Stripe from 'stripe';
 import { config } from '../config.js';
 import { db } from '../db/client.js';
-import { tierFromLookupKey } from './tier-map.js';
+import { tierFromLookupKey, TIERS } from './tier-map.js';
 import { sendDunningEmail, sendTrialEndingEmail } from './email-service.js';
 import { logger } from '../lib/logger.js';
 
@@ -28,12 +28,26 @@ export async function createCheckoutSession(opts: {
   cancelUrl: string;
 }): Promise<string> {
   const customerId = await getOrCreateStripeCustomer(opts.userId, opts.email);
+
+  let tierDescription = 'Airwaves Subscription';
+  for (const [tierKey, tierData] of Object.entries(TIERS)) {
+    if ((tierData.stripePriceIds as readonly string[]).includes(opts.priceId)) {
+      if (tierKey === 'basic') tierDescription = 'Airwaves Basic';
+      else if (tierKey === 'pro') tierDescription = 'Airwaves Pro';
+      else if (tierKey === 'pro_plus') tierDescription = 'Airwaves Pro Plus';
+      break;
+    }
+  }
+
   const session = await stripe.checkout.sessions.create({
     customer: customerId,
     mode: 'subscription',
     line_items: [{ price: opts.priceId, quantity: 1 }],
     success_url: opts.successUrl,
     cancel_url: opts.cancelUrl,
+    allow_promotion_codes: true,
+    customer_update: { name: 'auto', address: 'auto' },
+    subscription_data: { description: tierDescription },
     metadata: { userId: opts.userId },
   });
   return session.url!;
