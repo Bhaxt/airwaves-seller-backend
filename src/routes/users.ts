@@ -4,7 +4,7 @@ import { db } from '../db/client.js';
 import { config } from '../config.js';
 import { forbidden } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { getDevices } from '../services/license-service.js';
+import { getDevices, revokeDevice } from '../services/license-service.js';
 import { getOrCreateStripeCustomer, stripe } from '../services/stripe-service.js';
 
 function requireAdmin(request: FastifyRequest): void {
@@ -138,6 +138,62 @@ const usersRoutes: FastifyPluginAsync = async (fastify) => {
 
     logger.info({ userId, email, oldTier, newTier }, 'Admin tier override');
     return reply.send({ ok: true, tier: newTier });
+  });
+
+  fastify.post('/grant-license', async (request, reply) => {
+    requireAdmin(request);
+    const { email, tier } = z.object({
+      email: z.string().email(),
+      tier: z.enum(['basic', 'pro', 'pro_plus']).default('pro'),
+    }).parse(request.body);
+
+    const userRows = await db`
+      INSERT INTO users (email) VALUES (${email})
+      ON CONFLICT (email) DO UPDATE SET deleted_at = NULL
+      RETURNING id
+    `;
+    const userId = userRows[0].id as string;
+
+    const periodEnd = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const manualSubId = `manual_${userId}_${Date.now()}`;
+
+    await db`
+      INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_price_id, tier, status, current_period_end, cancel_at_period_end)
+      VALUES (${userId}, ${manualSubId}, 'manual', ${tier}, 'active', ${periodEnd}, false)
+    `;
+
+    await db`
+      INSERT INTO audit_log (user_id, action, subject, metadata)
+      VALUES (${userId}, 'admin.grant_license', ${email}, ${db.json({ tier })})
+    `;
+
+    logger.info({ userId, email, tier }, 'Admin granted manual license');
+    return reply.send({ ok: true, userId, tier, expiresAt: periodEnd.toISOString() });
+  });
+
+  fastify.post('/revoke-license', async (request, reply) => {
+    requireAdmin(request);
+    const { email, deviceId } = z.object({
+      email: z.string().email(),
+      deviceId: z.string().optional(),
+    }).parse(request.body);
+
+    const users = await db`SELECT id FROM users WHERE email = ${email} AND deleted_at IS NULL`;
+    if (users.length === 0) return reply.status(404).send({ ok: false, error: 'User not found' });
+
+    const userId = users[0].id as string;
+    await revokeDevice({ userId, deviceId });
+    logger.info({ userId, email, deviceId }, 'Admin revoked license');
+    return reply.send({ ok: true });
+  });
+
+  fastify.get<{ Params: { email: string } }>('/users/:email/licenses', async (request, reply) => {
+    requireAdmin(request);
+    const email = request.params.email;
+    const users = await db`SELECT id FROM users WHERE email = ${email} AND deleted_at IS NULL`;
+    if (users.length === 0) return reply.status(404).send({ error: 'User not found' });
+    const devices = await getDevices(users[0].id as string);
+    return reply.send({ devices });
   });
 
   fastify.post('/checkout-session', async (request, reply) => {
