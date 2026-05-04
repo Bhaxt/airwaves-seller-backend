@@ -162,6 +162,9 @@ const usersRoutes: FastifyPluginAsync = async (fastify) => {
       VALUES (${userId}, ${manualSubId}, 'manual', ${tier}, 'active', ${periodEnd}, false)
     `;
 
+    // Un-revoke all existing devices so the extension can re-validate immediately
+    await db`UPDATE licenses SET revoked_at = NULL WHERE user_id = ${userId}`;
+
     await db`
       INSERT INTO audit_log (user_id, action, subject, metadata)
       VALUES (${userId}, 'admin.grant_license', ${email}, ${db.json({ tier })})
