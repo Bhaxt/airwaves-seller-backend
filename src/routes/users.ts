@@ -1,14 +1,16 @@
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db } from '../db/client.js';
-import { config } from '../config.js';
 import { forbidden } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { getDevices, revokeDevice } from '../services/license-service.js';
+import { checkAdminSecret } from '../lib/admin-auth.js';
+import { getDevices, revokeDevice, bumpLicenseVersion } from '../services/license-service.js';
 import { getOrCreateStripeCustomer, stripe } from '../services/stripe-service.js';
 
+const adminMutationRateLimit = { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } };
+
 function requireAdmin(request: FastifyRequest): void {
-  if (request.headers['x-admin-secret'] !== config.ADMIN_SECRET) {
+  if (!checkAdminSecret(request.headers['x-admin-secret'])) {
     throw forbidden('Admin access required');
   }
 }
@@ -101,7 +103,7 @@ const usersRoutes: FastifyPluginAsync = async (fastify) => {
     return reply.send({ devices });
   });
 
-  fastify.post('/users/tier', async (request, reply) => {
+  fastify.post('/users/tier', adminMutationRateLimit, async (request, reply) => {
     requireAdmin(request);
     const { email, tier: newTier } = tierBodySchema.parse(request.body);
 
@@ -136,11 +138,14 @@ const usersRoutes: FastifyPluginAsync = async (fastify) => {
         ${db.json({ tier: newTier, previousTier: oldTier })})
     `;
 
+    // Bump version so the extension picks up the new tier features on next heartbeat
+    await bumpLicenseVersion(userId);
+
     logger.info({ userId, email, oldTier, newTier }, 'Admin tier override');
     return reply.send({ ok: true, tier: newTier });
   });
 
-  fastify.post('/grant-license', async (request, reply) => {
+  fastify.post('/grant-license', adminMutationRateLimit, async (request, reply) => {
     requireAdmin(request);
     const { email, tier } = z.object({
       email: z.string().email(),
@@ -155,12 +160,28 @@ const usersRoutes: FastifyPluginAsync = async (fastify) => {
     const userId = userRows[0].id as string;
 
     const periodEnd = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-    const manualSubId = `manual_${userId}_${Date.now()}`;
 
-    await db`
-      INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_price_id, tier, status, current_period_end, cancel_at_period_end)
-      VALUES (${userId}, ${manualSubId}, 'manual', ${tier}, 'active', ${periodEnd}, false)
+    const existingManual = await db`
+      SELECT id FROM subscriptions
+      WHERE user_id = ${userId}
+        AND stripe_subscription_id LIKE 'manual_%'
+        AND status IN ('active', 'trialing')
+      LIMIT 1
     `;
+
+    if (existingManual.length > 0) {
+      await db`
+        UPDATE subscriptions
+        SET tier = ${tier}, status = 'active', current_period_end = ${periodEnd}, updated_at = now()
+        WHERE id = ${existingManual[0].id}
+      `;
+    } else {
+      const manualSubId = `manual_${userId}_${Date.now()}`;
+      await db`
+        INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_price_id, tier, status, current_period_end, cancel_at_period_end)
+        VALUES (${userId}, ${manualSubId}, 'manual', ${tier}, 'active', ${periodEnd}, false)
+      `;
+    }
 
     // Un-revoke all existing devices so the extension can re-validate immediately
     await db`UPDATE licenses SET revoked_at = NULL WHERE user_id = ${userId}`;
@@ -170,11 +191,14 @@ const usersRoutes: FastifyPluginAsync = async (fastify) => {
       VALUES (${userId}, 'admin.grant_license', ${email}, ${db.json({ tier })})
     `;
 
+    // Bump version so the extension's heartbeat picks up the new tier within ~60s
+    await bumpLicenseVersion(userId);
+
     logger.info({ userId, email, tier }, 'Admin granted manual license');
     return reply.send({ ok: true, userId, tier, expiresAt: periodEnd.toISOString() });
   });
 
-  fastify.post('/revoke-license', async (request, reply) => {
+  fastify.post('/revoke-license', adminMutationRateLimit, async (request, reply) => {
     requireAdmin(request);
     const { email, deviceId } = z.object({
       email: z.string().email(),
@@ -199,7 +223,7 @@ const usersRoutes: FastifyPluginAsync = async (fastify) => {
     return reply.send({ devices });
   });
 
-  fastify.post('/checkout-session', async (request, reply) => {
+  fastify.post('/checkout-session', adminMutationRateLimit, async (request, reply) => {
     requireAdmin(request);
     const { email, priceId, successUrl, cancelUrl } = checkoutBodySchema.parse(request.body);
 
@@ -224,6 +248,55 @@ const usersRoutes: FastifyPluginAsync = async (fastify) => {
     });
 
     return reply.send({ url: session.url });
+  });
+
+  fastify.post('/cancel-subscription', adminMutationRateLimit, async (request, reply) => {
+    requireAdmin(request);
+    const { email } = z.object({ email: z.string().email() }).parse(request.body);
+
+    const users = await db`SELECT id FROM users WHERE email = ${email} AND deleted_at IS NULL`;
+    if (users.length === 0) return reply.status(404).send({ error: 'User not found' });
+    const userId = users[0].id as string;
+
+    const subs = await db`
+      SELECT id, stripe_subscription_id
+      FROM subscriptions
+      WHERE user_id = ${userId} AND status IN ('active', 'trialing', 'past_due')
+      ORDER BY created_at DESC LIMIT 1
+    `;
+    if (subs.length === 0) return reply.send({ ok: true, message: 'no active subscription' });
+
+    const sub = subs[0];
+    if (!(sub.stripe_subscription_id as string).startsWith('manual_')) {
+      await stripe.subscriptions.cancel(sub.stripe_subscription_id as string);
+      await db`
+        INSERT INTO audit_log (user_id, action, subject, metadata)
+        VALUES (${userId}, 'subscription.canceled', ${email}, ${db.json({ canceledBy: 'admin', via: 'stripe' })})
+      `;
+      return reply.send({ ok: true, message: 'stripe subscription canceled — webhook will update status' });
+    }
+
+    await db`UPDATE subscriptions SET status = 'canceled', updated_at = now() WHERE id = ${sub.id}`;
+    await revokeDevice({ userId });
+    await db`
+      INSERT INTO audit_log (user_id, action, subject, metadata)
+      VALUES (${userId}, 'subscription.canceled', ${email}, ${db.json({ canceledBy: 'admin', via: 'manual' })})
+    `;
+    return reply.send({ ok: true });
+  });
+
+  fastify.get<{ Params: { email: string } }>('/users/:email/audit', async (request, reply) => {
+    requireAdmin(request);
+    const email = request.params.email;
+    const users = await db`SELECT id FROM users WHERE email = ${email} AND deleted_at IS NULL`;
+    if (users.length === 0) return reply.status(404).send({ error: 'User not found' });
+    const userId = users[0].id as string;
+    const entries = await db`
+      SELECT action, subject, metadata, created_at
+      FROM audit_log WHERE user_id = ${userId}
+      ORDER BY created_at DESC LIMIT 50
+    `;
+    return reply.send({ entries });
   });
 };
 

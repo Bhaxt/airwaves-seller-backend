@@ -89,27 +89,13 @@ export async function handleWebhookEvent(event: Stripe.Event): Promise<void> {
         break;
       }
 
-      // Upsert user so brand-new purchasers are always in the DB before subscription events fire.
-      const userRows = await db`
-        INSERT INTO users (email) VALUES (${email})
-        ON CONFLICT (email) DO UPDATE SET deleted_at = NULL
-        RETURNING id
-      `;
-      const userId = userRows[0].id;
-
-      // Link the Stripe customer to the user (idempotent).
-      await db`
-        INSERT INTO stripe_customers (user_id, stripe_customer_id)
-        VALUES (${userId}, ${customerId})
-        ON CONFLICT (user_id) DO NOTHING
-      `;
-
-      // If this checkout was for Tier 3, immediately upsert an active pro_plus subscription
-      // so the extension license is available without waiting for subscription.created.
+      // If this checkout was for Tier 3, we need the resolved subscription/tier
+      // BEFORE opening the transaction so the network call can't hold a tx open.
       const subId = typeof session.subscription === 'string'
         ? session.subscription
         : (session.subscription as Stripe.Subscription | null)?.id ?? null;
 
+      let resolvedSub: { sub: Stripe.Subscription; priceId: string; tier: string } | null = null;
       if (subId) {
         try {
           const sub = await stripe.subscriptions.retrieve(subId);
@@ -123,33 +109,62 @@ export async function handleWebhookEvent(event: Stripe.Event): Promise<void> {
               } catch (_e) { /* non-fatal */ }
             }
             const tier = lookupKey ? tierFromLookupKey(lookupKey) : 'pro_plus';
-            await db`
-              INSERT INTO subscriptions (
-                user_id, stripe_subscription_id, stripe_price_id, tier, status,
-                current_period_end, cancel_at_period_end
-              ) VALUES (
-                ${userId}, ${sub.id}, ${priceId}, ${tier},
-                ${sub.status as string}, ${new Date(sub.current_period_end * 1000)},
-                ${sub.cancel_at_period_end}
-              )
-              ON CONFLICT (stripe_subscription_id) DO UPDATE SET
-                tier = ${tier},
-                status = ${sub.status as string},
-                current_period_end = ${new Date(sub.current_period_end * 1000)},
-                cancel_at_period_end = ${sub.cancel_at_period_end},
-                updated_at = now()
-            `;
-            logger.info({ userId, email, tier, subId }, 'Tier 3 checkout: pro_plus license granted');
+            resolvedSub = { sub, priceId, tier };
           }
         } catch (err) {
           logger.warn({ err, subId }, 'checkout.session.completed: failed to retrieve subscription for Tier 3 grant');
         }
       }
 
-      await db`
-        INSERT INTO audit_log (user_id, action, subject)
-        VALUES (${userId}, 'subscription.checkout_completed', ${customerId})
-      `;
+      // Atomic: user upsert + customer link + subscription grant + audit + license-version
+      // bump must all persist together or not at all. If any fails, Stripe retries.
+      await db.begin(async (sql) => {
+        const userRows = await sql`
+          INSERT INTO users (email) VALUES (${email})
+          ON CONFLICT (email) DO UPDATE SET deleted_at = NULL
+          RETURNING id
+        `;
+        const userId = userRows[0].id;
+
+        await sql`
+          INSERT INTO stripe_customers (user_id, stripe_customer_id)
+          VALUES (${userId}, ${customerId})
+          ON CONFLICT (user_id) DO NOTHING
+        `;
+
+        if (resolvedSub) {
+          const { sub, priceId, tier } = resolvedSub;
+          await sql`
+            INSERT INTO subscriptions (
+              user_id, stripe_subscription_id, stripe_price_id, tier, status,
+              current_period_end, cancel_at_period_end
+            ) VALUES (
+              ${userId}, ${sub.id}, ${priceId}, ${tier},
+              ${sub.status as string}, ${new Date(sub.current_period_end * 1000)},
+              ${sub.cancel_at_period_end}
+            )
+            ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+              tier = ${tier},
+              status = ${sub.status as string},
+              current_period_end = ${new Date(sub.current_period_end * 1000)},
+              cancel_at_period_end = ${sub.cancel_at_period_end},
+              updated_at = now()
+          `;
+          logger.info({ userId, email, tier, subId: sub.id }, 'Tier 3 checkout: pro_plus license granted');
+        }
+
+        await sql`
+          INSERT INTO audit_log (user_id, action, subject)
+          VALUES (${userId}, 'subscription.checkout_completed', ${customerId})
+        `;
+
+        // Bump per-user license_version so the extension picks up the new
+        // subscription within ~60s (heartbeat poll) instead of waiting for
+        // the 6h JWT to expire.
+        await sql`
+          UPDATE users SET license_version = license_version + 1 WHERE id = ${userId}
+        `;
+      });
       break;
     }
 
@@ -174,80 +189,94 @@ export async function handleWebhookEvent(event: Stripe.Event): Promise<void> {
       }
       const tier = tierFromLookupKey(lookupKey);
 
-      await db`
-        INSERT INTO subscriptions (
-          user_id, stripe_subscription_id, stripe_price_id, tier, status,
-          current_period_end, cancel_at_period_end
-        ) VALUES (
-          ${userId}, ${sub.id}, ${currentPriceId}, ${tier},
-          ${sub.status as string}, ${new Date(sub.current_period_end * 1000)},
-          ${sub.cancel_at_period_end}
-        )
-        ON CONFLICT (stripe_subscription_id) DO UPDATE SET
-          tier = ${tier},
-          status = ${sub.status as string},
-          current_period_end = ${new Date(sub.current_period_end * 1000)},
-          cancel_at_period_end = ${sub.cancel_at_period_end},
-          updated_at = now()
-      `;
+      // Atomic: subscription upsert + audit log entries + license-version bump
+      // must commit together.
+      await db.begin(async (sql) => {
+        await sql`
+          INSERT INTO subscriptions (
+            user_id, stripe_subscription_id, stripe_price_id, tier, status,
+            current_period_end, cancel_at_period_end
+          ) VALUES (
+            ${userId}, ${sub.id}, ${currentPriceId}, ${tier},
+            ${sub.status as string}, ${new Date(sub.current_period_end * 1000)},
+            ${sub.cancel_at_period_end}
+          )
+          ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+            tier = ${tier},
+            status = ${sub.status as string},
+            current_period_end = ${new Date(sub.current_period_end * 1000)},
+            cancel_at_period_end = ${sub.cancel_at_period_end},
+            updated_at = now()
+        `;
 
-      // Tier 3-specific grant/revoke logging for mid-cycle plan changes.
-      if (event.type === 'customer.subscription.updated') {
-        const prevAttributes = (event.data as Stripe.Event.Data).previous_attributes as Record<string, unknown> | undefined;
-        const prevItems = prevAttributes?.items as { data?: Array<{ price: { id: string } }> } | undefined;
-        const prevPriceId = prevItems?.data?.[0]?.price?.id ?? null;
+        // Tier 3-specific grant/revoke logging for mid-cycle plan changes.
+        if (event.type === 'customer.subscription.updated') {
+          const prevAttributes = (event.data as Stripe.Event.Data).previous_attributes as Record<string, unknown> | undefined;
+          const prevItems = prevAttributes?.items as { data?: Array<{ price: { id: string } }> } | undefined;
+          const prevPriceId = prevItems?.data?.[0]?.price?.id ?? null;
 
-        const isNowTier3 = currentPriceId === TIER_3_PRICE_ID && sub.status === 'active';
-        const wasTier3 = prevPriceId === TIER_3_PRICE_ID;
-        const isNowInactive = ['canceled', 'past_due', 'unpaid'].includes(sub.status);
+          const isNowTier3 = currentPriceId === TIER_3_PRICE_ID && sub.status === 'active';
+          const wasTier3 = prevPriceId === TIER_3_PRICE_ID;
+          const isNowInactive = ['canceled', 'past_due', 'unpaid'].includes(sub.status);
 
-        if (isNowTier3 && !wasTier3) {
-          logger.info({ userId, subId: sub.id, tier }, 'Tier 3 upgrade: pro_plus license granted');
-        } else if (wasTier3 && !isNowTier3 && isNowInactive) {
-          await db`
-            INSERT INTO audit_log (user_id, action, subject, metadata)
-            VALUES (${userId}, 'subscription.tier3_revoked', ${sub.id},
-              ${db.json({ reason: 'subscription_updated', status: sub.status, previousTier: 'pro_plus' })})
-          `;
-          logger.info({ userId, subId: sub.id, status: sub.status }, 'Tier 3 downgrade/lapse: pro_plus license revoked');
+          if (isNowTier3 && !wasTier3) {
+            logger.info({ userId, subId: sub.id, tier }, 'Tier 3 upgrade: pro_plus license granted');
+          } else if (wasTier3 && !isNowTier3 && isNowInactive) {
+            await sql`
+              INSERT INTO audit_log (user_id, action, subject, metadata)
+              VALUES (${userId}, 'subscription.tier3_revoked', ${sub.id},
+                ${sql.json({ reason: 'subscription_updated', status: sub.status, previousTier: 'pro_plus' })})
+            `;
+            logger.info({ userId, subId: sub.id, status: sub.status }, 'Tier 3 downgrade/lapse: pro_plus license revoked');
+          }
         }
-      }
 
-      const action = 'subscription.' + event.type.split('.').pop();
-      await db`
-        INSERT INTO audit_log (user_id, action, subject, metadata)
-        VALUES (${userId}, ${action}, ${sub.id},
-          ${db.json({ tier, status: sub.status })})
-      `;
+        const action = 'subscription.' + event.type.split('.').pop();
+        await sql`
+          INSERT INTO audit_log (user_id, action, subject, metadata)
+          VALUES (${userId}, ${action}, ${sub.id},
+            ${sql.json({ tier, status: sub.status })})
+        `;
+
+        // Bump per-user license_version so the extension picks up the
+        // tier/status change within ~60s on next heartbeat.
+        await sql`
+          UPDATE users SET license_version = license_version + 1 WHERE id = ${userId}
+        `;
+      });
       break;
     }
 
     case 'customer.subscription.deleted': {
       const sub = event.data.object as Stripe.Subscription;
-      const deletedPriceId = sub.items.data[0]?.price.id ?? '';
+      const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id;
 
-      await db`
-        UPDATE subscriptions SET status = 'canceled', updated_at = now()
-        WHERE stripe_subscription_id = ${sub.id}
-      `;
+      // Atomic: subscription cancel + license revoke + audit + license-version
+      // bump must commit together so the extension can never see "subscription
+      // canceled but license still valid".
+      await db.begin(async (sql) => {
+        await sql`
+          UPDATE subscriptions SET status = 'canceled', updated_at = now()
+          WHERE stripe_subscription_id = ${sub.id}
+        `;
 
-      // If the cancelled plan was Tier 3, explicitly downgrade the user's tier to free_trial
-      // so the extension license is revoked immediately.
-      if (deletedPriceId === TIER_3_PRICE_ID) {
-        const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id;
-        const customers = await db`SELECT user_id FROM stripe_customers WHERE stripe_customer_id = ${customerId}`;
+        const customers = await sql`SELECT user_id FROM stripe_customers WHERE stripe_customer_id = ${customerId}`;
         if (customers.length > 0) {
-          const userId = customers[0].user_id;
-          // Create a sentinel free_trial subscription row to record the downgrade.
-          // Any active Tier 3 sub rows are already marked canceled above.
-          await db`
+          const userId = customers[0].user_id as string;
+          await sql`UPDATE licenses SET revoked_at = now() WHERE user_id = ${userId} AND revoked_at IS NULL`;
+          await sql`
             INSERT INTO audit_log (user_id, action, subject, metadata)
-            VALUES (${userId}, 'subscription.tier3_revoked', ${sub.id},
-              ${db.json({ reason: 'subscription_deleted', previousTier: 'pro_plus' })})
+            VALUES (${userId}, 'subscription.deleted', ${sub.id},
+              ${sql.json({ reason: 'stripe_subscription_deleted' })})
           `;
-          logger.info({ userId, subId: sub.id }, 'Tier 3 subscription deleted: pro_plus license revoked');
+          // Bump per-user license_version so the extension picks up the
+          // revocation within ~60s on next heartbeat.
+          await sql`
+            UPDATE users SET license_version = license_version + 1 WHERE id = ${userId}
+          `;
+          logger.info({ userId, subId: sub.id }, 'Stripe subscription deleted — licenses revoked');
         }
-      }
+      });
       break;
     }
 
